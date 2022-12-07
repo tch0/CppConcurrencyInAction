@@ -5,3 +5,5 @@
 - [第四章：并发操作的同步](./04Synchronization)
 - [第五章：内存模型和原子操作](./05MemoryModelAndAtomic)
 - [第六章：基于锁的数据结构](./06LockBasedDataStructure)
+- [第七章：无锁数据结构](./07LockFreeDataStructure)
+- [第八章：设计并发代码](./08DesignOfConcurrencyCode)
