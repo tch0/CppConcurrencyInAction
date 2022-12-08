@@ -7,3 +7,4 @@
 - [第六章：基于锁的数据结构](./06LockBasedDataStructure)
 - [第七章：无锁数据结构](./07LockFreeDataStructure)
 - [第八章：设计并发代码](./08DesignOfConcurrencyCode)
+- [第九章：高级线程管理](./09AdvancedThreadManagement)
