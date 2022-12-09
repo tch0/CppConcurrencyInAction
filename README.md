@@ -9,3 +9,4 @@
 - [第八章：设计并发代码](./08DesignOfConcurrencyCode)
 - [第九章：高级线程管理](./09AdvancedThreadManagement)
 - [第十章：并行算法](./10ParallelAlgorithms)
+- [第十一章：多线程应用的测试和排错](./11TestAndDebug)
