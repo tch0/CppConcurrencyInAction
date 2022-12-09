@@ -164,7 +164,7 @@ public:
 可以改进的点：
 - 实践中针对具体应用，可能存在很多其他的改进方法，需要在实践中总结。
 - 可以动态调整线程池规模使得CPU的使用效率最佳，其中甚至包括处理线程发生阻塞的情形，如等待IO或者等待互斥解锁。
-    - 例如如果线程池中处于等待的线程很多，而只有少量线程处于运行状态，可以动态新增一个线程到线程池中。
+    - 例如如果线程池中处于等待的线程很多，而只有少量线程处于运行状态，可以动态新增一些线程到线程池中。
     - 当等待中线程解锁后，又动态降低线程池中线程数量以维持处于运行状态的线程数量处于最优状态。
 
 ## 中断线程
@@ -178,6 +178,318 @@ public:
     - 给要结束的线程发送停止信号，让线程受到信号后自己结束，以妥善处理其中的数据。
 - 我们可以为每一个中断线程的原因设计代码，但是这样未免太小题大做了。
 - 可以实现通用的中断方式，以用于任何适用的情况。
-- C++11标准库尚未提供这种方式，C++20引入的`std::jthread`提供了，这里先尝试自行实现而不适用标准库接口。最后再来讨论`std::jthread`。
+- C++11标准库尚未提供这种方式，C++20引入的`std::jthread`提供了。这里先尝试自行实现而不使用标准库接口，最后再来讨论`std::jthread`。
 
+发起一个线程，以及把它中断：
+- 通常的做法是包装`std::thread`，通过其中定制的数据结构处理中断，并且在线程执行的代码中安插中断点，表明此处可以中断。
+- 将`thread_local`变量作为中断专门定制的数据结构，在启动时设置此变量。同时又需要外部（发起线程的地方）能够访问该数据结构。通过接口调用通知线程已经发起了中断。
+- 实现：
+```C++
+class InterruptFlag
+{
+    std::atomic<bool> flag {false};
+public:
+    void set()
+    {
+        flag = true;
+    }
+    bool isSet()
+    {
+        return flag.load();
+    }
+};
 
+class InterruptibleThread
+{
+    std::thread internalThread;
+    InterruptFlag* flag;
+    inline static thread_local InterruptFlag thisThreadInterruptFlag;
+public:
+    template<typename FunctionType>
+    InterruptibleThread(FunctionType f) : flag(nullptr)
+    {
+        std::promise<InterruptFlag*> p;
+        internalThread = std::thread([f, &p] {
+                p.set_value(&InterruptibleThread::thisThreadInterruptFlag);
+                f();
+            });
+        flag = p.get_future().get();
+    }
+    ~InterruptibleThread()
+    {
+        if (internalThread.joinable())
+        {
+            internalThread.join();
+        }
+    }
+    void join()
+    {
+        flag = nullptr;
+        internalThread.join();
+    }
+    void detach()
+    {
+        flag = nullptr;
+        internalThread.detach();
+    }
+    bool joinable()
+    {
+        return internalThread.joinable();
+    }
+    void interrupt()
+    {
+        if (flag)
+        {
+            flag->set();
+        }
+    }
+};
+```
+- 在线程启动时，通过`std::promise`将线程局部的标志地址传递给`InterruptibleThread`对象，外部通过这个对象调用`interrupt`函数设置标志以通知线程内部已经发起了中断。
+- 线程退出或者分离时需要确保`flag`变量被清除，以免指针悬空。
+
+检测中断：
+- 在线程内部则需要检测是否发生了中断，作为一个中断点函数包装，调用该函数则表示此处是一个中断点，可以中断。
+```C++
+class ThreadInterrupted : public std::exception
+{
+public:
+    virtual const char* what() const noexcept override
+    {
+        return "thread interrupted!";
+    }
+};
+
+// check if there is a interruption
+void interruptionPoint()
+{
+    if (InterruptibleThread::thisThreadInterruptFlag.isSet())
+    {
+        throw ThreadInterrupted();
+    }
+}
+```
+- 在线程内部代码合适的位置安插`interruptionPoint`即可实现中断。
+- 因为是以抛异常的方式中断的，所以代码中需要保证异常安全，最好使用RAII管理资源以及互斥锁。
+
+中断条件变量上的等待：
+- 当线程处于阻塞等待条件变量时，即是发送了中断信号，也需要等到条件变量通知唤醒了线程之后才能处理，这增加了不必要的等待。
+- 我们可能会想要一种可以被中断的等待，这可以通过在调用`interrupt`时向正在等待的条件变量发送通知解决。
+- 所以也需要`InterruptFlag`存储额外的信息。
+```C++
+class InterruptFlag
+{
+    std::atomic<bool> flag {false};
+    std::condition_variable* threadCond {};
+    std::mutex condMutex;
+public:
+    void set()
+    {
+        flag.store(true);
+        std::lock_guard lk(condMutex);
+        if (threadCond)
+        {
+            threadCond->notify_all();
+        }
+    }
+    bool isSet()
+    {
+        return flag.load();
+    }
+    void setConditionVariable(std::condition_variable& cv)
+    {
+        std::lock_guard lk(condMutex);
+        threadCond = &cv;
+    }
+    void clearConditionVariable()
+    {
+        std::lock_guard<std::mutex> lk(condMutex);
+        threadCond = nullptr;
+    }
+    struct ClearCVOnDestruction
+    {
+        ~ClearCVOnDestruction();
+    };
+};
+
+thread_local InterruptFlag thisThreadInterruptFlag;
+
+InterruptFlag::ClearCVOnDestruction::~ClearCVOnDestruction()
+{
+    thisThreadInterruptFlag.clearConditionVariable();
+}
+```
+- 通知时使用`notify_all`而不是`notify_one`防止通知不到，所以其他等待在此条件变量上的线程就会假醒。但本来就会有假醒，故通常都是谓词版本，所以一般来说没有问题。
+- 为了防止中断后指针空悬，中断后需要清空条件变量指针，因为中断是抛异常，所以需要使用RAII类，也就是`ClearCVOnDestruction`。
+- 实现可以中断的等待：
+```C++
+void interruptibleWait(std::condition_variable& cv, std::unique_lock<std::mutex>& lk)
+{
+    interruptionPoint();
+    thisThreadInterruptFlag.setConditionVariable(cv);
+    cv.wait(lk);
+    thisThreadInterruptFlag.clearConditionVariable();
+    interruptionPoint();
+}
+```
+- 这个实现存在两个问题：
+    - 异常不安全：`wait`可能抛出异常，此时`thisThreadInterruptFlag`中存储的条件变量指针可能空悬。
+    - 中断标志的设置可能在`cv.wait(lk)`之前，导致虽然已经中断但是`cv.wait(lk)`等不到通知，依然持续等待下去。
+- 所以只能退而求其次采用限时等待，保证等待一定能返回。但是时限太短会导致频繁伪唤醒。**这个问题属于顽疾，确实难以解决**。
+- 修改后的实现：
+```C++
+void interruptibleWait(std::condition_variable& cv, std::unique_lock<std::mutex>& lk)
+{
+    interruptionPoint();
+    thisThreadInterruptFlag.setConditionVariable(cv);
+    InterruptFlag::ClearCVOnDestruction guard; // RAII guard on InterruptFlag::threadCond
+    interruptionPoint();
+    cv.wait_for(lk, 1ms);
+    interruptionPoint();
+}
+
+template<typename Predicate>
+void interruptibleWait(std::condition_variable& cv, std::unique_lock<std::mutex>& lk, Predicate pred)
+{
+    interruptionPoint();
+    thisThreadInterruptFlag.setConditionVariable(cv);
+    InterruptFlag::ClearCVOnDestruction guard; // RAII guard on InterruptFlag::threadCond
+    interruptionPoint();
+    while (!thisThreadInterruptFlag.isSet() && !pred())
+    {
+        cv.wait_for(lk, 1ms);
+    }
+    interruptionPoint();
+}
+```
+- 其中的带断言版本和带断言版本的`std::condition_variable::wait`功能几乎完全一致并且可以中断，只是会更频繁地被唤醒检查检查断言。
+- 而不带断言版本则可以说和不带断言的`std::condition_variable::wait`功能都不一样了。实践中最好优先使用后者。
+
+使用`std::condition_variable_any`：
+- `std::condition_variable`只能与`std::unique_lock<std::mutex>`配合，还需要考虑其他的条件变量和互斥锁（包括自定义的锁）：
+```C++
+class InterruptFlag
+{
+    std::atomic<bool> flag {false};
+    std::condition_variable* threadCond {};
+    std::condition_variable_any* threadCondAny {};
+    std::mutex condMutex;
+public:
+    void set()
+    {
+        flag.store(true);
+        std::lock_guard lk(condMutex);
+        if (threadCond)
+        {
+            threadCond->notify_all();
+        }
+        else if (threadCondAny)
+        {
+            threadCondAny->notify_all();
+        }
+    }
+    template<typename Lockable>
+    void wait(std::condition_variable_any& cv, Lockable& lk)
+    {
+        struct CustomLock
+        {
+            InterruptFlag *self;
+            Lockable& lk;
+            CustomLock(InterruptFlag* _self, std::condition_variable_any& cv, Lockable& _lk)
+                : self(_self), lk(_lk)
+            {
+                self->condMutex.lock();
+                self->threadCondAny = &cv;
+            }
+            void unlock()
+            {
+                lk.unlock();
+                self->condMutex.unlock();
+            }
+            void lock()
+            {
+                std::lock(self->condMutex, lk);
+            }
+            ~CustomLock()
+            {
+                self->threadCondAny = nullptr;
+                self->condMutex.unlock();
+            }
+        }
+        CustomLock cl(this, cv, lk);
+        interruptionPoint();
+        cv.wait(cl);
+        interruptionPoint();
+    }
+    // others are the same...
+};
+
+template<typename Lockable>
+void interruptibleWait(std::condition_variable_any& cv, Lockable& lk)
+{
+    thisThreadInterruptFlag.wait(cv, lk);
+}
+```
+- 这里通过获取锁`condMutex`规避了前面提到的问题，`InterruptFlag::set`中条件变量的通知由`condMutex`进行了保护，并且在`wait`前调用了一次`interruptionPoint`，保证如果恰巧此时发出信号那么一定会退出。
+- `std::condition_variable`也可以这样解决。
+- 基于这个接口可以实现限时等待和带谓词等待，略。
+- 注意传入时`lk`必须处于锁定状态，同条件变量`wait`接口要求一致。
+
+中断其他阻塞型等待：
+- 条件变量上的等待现在已经可以完美被中断了。
+- 但是其他的阻塞型中断，比如互斥上的等待、`std::future`上的等待以及类似等待。
+- 因为他们都不提供带谓词的等待，所以只能使用限时等待不断循环来保证一定会中断：
+```C++
+template<typename T>
+void interruptibleWait(std::future<T>& f)
+{
+    while (!thisThreadInterruptFlag.isSet())
+    {
+        if (f.wait_for(1ms) == std::future_status::ready)
+        {
+            break;
+        }
+    }
+    interruptionPoint();
+}
+```
+- 这是中断`std::future`上的等待的方法。
+- 至于中断互斥上的等待，目前来看好像没有办法做到，只能从程序设计上考虑，让其他线程把互斥让出来？
+
+**中断的处理**：
+- 中断是一个异常，所以可以使用标准`try catch`处理。
+- 至于捕获之后是结束线程，还是仅仅结束线程中运行的任务然后继续执行其他任务（比如线程池中的线程），取决于具体场景与设计。
+- 为了防止忘记处理，线程抛出异常时调用`std::terminate`，可以在`InterruptibleThread`构造函数中进行捕获。
+```C++
+template<typename FunctionType>
+InterruptibleThread::InterruptibleThread(FunctionType f) : flag(nullptr)
+{
+    std::promise<InterruptFlag*> p;
+    internalThread = std::thread([f, &p] {
+            p.set_value(&thisThreadInterruptFlag);
+            try {
+                f();
+            } catch(const ThreadInterrupted& e) {}
+        });
+    flag = p.get_future().get();
+}
+```
+- 线程内部（函数`f`内）可以进行更精细的定制处理。
+
+应用程序退出时中断后台任务：
+- 当应用程序结束时，后台可能还运行着一些进程，我们需要妥善地结束他们，其中一种方式就是中断他们。
+- 可以先批量中断他们，然后再等待他们结束：
+```C++
+for (std::size_t i = 0; i < backgroundThreads.size(); ++i)
+{
+    backgroundThreads[i].interrupt();
+}
+for (std::size_t i = 0; i < backgroundThreads.size(); ++i)
+{
+    backgroundThreads[i].join();
+}
+```
+
+使用`std::jthread`：
+- C++20引入了`std::jthread`，其析构时可以自动结合。
+- TODO。
